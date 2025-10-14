@@ -1,7 +1,7 @@
-name: "dental_genetics"
+name: dental_genetics
 output_dir: ../docs
 navbar:
-  title: "dental_genetics"
+  title: dental_genetics
   left:
   - text: Home
     href: index.html
@@ -9,6 +9,10 @@ navbar:
     href: about.html
   - text: License
     href: license.html
+  right:
+  - icon: fab fa-github
+    text: Source code
+    href: https://github.com/han16/dental_genetics
 output:
   workflowr::wflow_html:
     toc: yes
