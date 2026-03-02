@@ -320,3 +320,65 @@ plot_susie_locus(susie_results, 10)
 
 [LD matrix inconsistency issue](https://github.com/stephenslab/susieR/issues/148)
 
+
+## 
+
+
+```{r, message=F, warning=F}
+library(biomaRt)
+
+# Initialize Ensembl (GRCh37/hg19 or hg38 depending on your data)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://grch37.ensembl.org")
+
+# 2. Get the unique chromosome/position ranges from results
+# We search 50kb upstream and downstream to find nearby genes
+regions <- final_summary %>%
+  mutate(start = BP - 50000, end = BP + 50000) %>%
+  dplyr::select(CHR, start, end) %>%
+  distinct()
+
+# 3. Query biomaRt
+# Note: getBM can be slow with many rows, so we query by chromosome
+gene_list <- getBM(
+  attributes = c('ensembl_gene_id', 'external_gene_name', 'chromosome_name', 'start_position', 'end_position'),
+  filters = 'chromosome_name',
+  values = unique(regions$CHR),
+  mart = ensembl
+)
+```
+
+```{r, message=F, warning=F}
+# 4. Define a helper function to find the nearest gene
+find_nearest_gene <- function(chr, pos, genes_df) {
+  # Filter genes on the same chromosome
+  chrom_genes <- genes_df[genes_df$chromosome_name == as.character(chr), ]
+  
+  if (nrow(chrom_genes) == 0) return(c(NA, NA))
+  
+  # Calculate distance to gene start/end (whichever is closer)
+  dist_start <- abs(chrom_genes$start_position - pos)
+  dist_end   <- abs(chrom_genes$end_position - pos)
+  min_dist   <- pmin(dist_start, dist_end)
+  
+  nearest_idx <- which.min(min_dist)
+  return(c(chrom_genes$ensembl_gene_id[nearest_idx], 
+           chrom_genes$external_gene_name[nearest_idx]))
+}
+
+# 5. Apply to final_summary
+mapping_results <- t(mapply(find_nearest_gene, 
+                            final_summary$CHR, 
+                            final_summary$BP, 
+                            MoreArgs = list(genes_df = gene_list)))
+
+# 6. Add columns to your summary
+final_summary$ensembl_gene_id <- mapping_results[, 1]
+final_summary$external_gene_name <- mapping_results[, 2]
+
+
+final_summary %>%
+  dplyr::select(Locus, MarkerName, PIP, external_gene_name, ensembl_gene_id, everything()) %>%
+  arrange(desc(PIP)) %>%
+  datatable(caption = "SuSiE Results with Nearest hg19 Genes")
+```
+
