@@ -1,0 +1,322 @@
+---
+title: "run susieR"
+output:
+  workflowr::wflow_html:
+    code_folding: hide
+    toc: true
+date: "2026-02-02"
+---
+
+
+```{r, message=F, warning=F}
+#install.packages("susieR")
+rm(list=ls())
+library(rprojroot)
+library(susieR)
+library(data.table)
+library(dplyr)
+library(susieR)
+library(DT)
+root <- rprojroot::find_rstudio_root_file()
+```
+
+
+```{r, message=F, warning=F, eval=F}
+######## load GWAS summary data ##########
+
+#dfss_summary=read.table(file.path(root, "../data_samples/EUR_DFSS_incl_HCHSSOL.txt"), header=T)
+#saveRDS(dfss_summary, file=file.path(root, "../data_samples/dfss_summary.RDS"))
+dfss_summary=readRDS(file.path(root, "../data_samples/dfss_summary.RDS"))
+head(dfss_summary)
+dim(dfss_summary)
+```
+
+
+
+
+
+## DFSS
+
+### prepare the input data 
+
+```{r, message=F, warning=F}
+
+############################
+# Paths
+############################
+gwas_file=file.path(root, "../data_samples/dfss_summary.RDS")
+
+ld_dir    <- file.path(root,"../LDMatrix/04_compute_LD_for_Shungin2019_EUR_DFSS_output")
+#ld_dir    <- file.path(root,"../LDMatrix/04_compute_LD_for_Shungin2019_EUR_Nteeth_output")
+
+WINDOW <- 500000
+L_MAX  <- 10
+```
+
+
+```{r, message=F, warning=F}
+
+############################
+# Load GWAS
+############################
+gwas <- readRDS(gwas_file)
+gwas$MarkerName <- sub(":ID$", "", gwas$MarkerName)  # remove "ID" if any 
+gwas <- gwas %>% distinct(MarkerName, .keep_all = TRUE)  # remove duplicate MarkerName
+
+
+table(grepl(":ID$", gwas$MarkerName)) # Quick sanity check
+gwas <- as.data.table(gwas)
+
+# Parse chr / pos from MarkerName
+gwas[, c("CHR", "BP") := tstrsplit(MarkerName, ":", fixed = TRUE, keep = 1:2)]
+gwas[, CHR := as.integer(CHR)]
+gwas[, BP  := as.integer(BP)]
+
+
+############################
+# List LD files
+############################
+ld_files <- list.files(ld_dir, pattern = "\\.ld$", full.names = TRUE)
+
+############################
+# Container for results
+############################
+susie_results <- vector("list", length(ld_files))
+names(susie_results) <- basename(ld_files)
+
+
+```
+
+
+
+### run susieR
+
+
+
+```{r, message=F, warning=F, eval=F}
+for (i in seq_along(ld_files)) 
+{
+#  i=1
+  ############################
+  # Load LD (Square Matrix)
+  ############################
+  ld_file <- ld_files[i]
+  locus_id <- sub("^LD_|\\.ld$", "", basename(ld_file)) 
+  cat("SNP:", locus_id, "is running", "\n")
+
+  # Parse Chr and Pos from filename
+  base <- sub("\\.ld$", "", locus_id) 
+  chr <- as.integer(sub("_.*", "", base)) 
+  pos <- as.integer(sub(".*_", "", base))
+
+  # Read the LD square matrix
+  # Note: adjust 'header' and 'check.names' based on the  file format
+  snplist_file <- sub("\\.ld$", ".snplist", ld_file)
+  snp_names <- readLines(snplist_file)
+  
+  # Keep only the first name if multiple are present (separated by ;)
+  snp_names <- sub(";.*", "", snp_names)
+  
+  R_raw <- as.matrix(read.table(ld_file, header = FALSE))
+  sum(is.na(R_raw))
+  rownames(R_raw) <- colnames(R_raw) <- snp_names
+  
+  ######### map_file is to map snp id, rsXXXX to coordinate chr:pos since gwas uses coordinate 
+  map_file     <- sub("\\.ld$", ".id_map", ld_file)
+  #  Read the ID Map (rsID to chr:pos)
+  id_lookup <- read.table(map_file, header = FALSE, stringsAsFactors = FALSE)
+  colnames(id_lookup) <- c("rsid", "coords")
+  
+  # Translate rsIDs to chr:pos based on the map, some are not matched, leading to NA's 
+  matched_indices <- match(snp_names, id_lookup$rsid)
+  chr_pos_names   <- id_lookup$coords[matched_indices]
+  
+  # Assign the new chr:pos names to LD matrix
+  rownames(R_raw) <- colnames(R_raw) <- chr_pos_names
+  snps_in_ld <- colnames(R_raw)
+  
+  ############################
+  # Align GWAS and LD
+  ############################
+  gwas_locus <- gwas[
+      CHR == chr & 
+      BP >= (pos - WINDOW) & 
+      BP <= (pos + WINDOW)
+    ]
+
+  if (nrow(gwas_locus) < 10) {
+    warning("Too few GWAS SNPs, skipping ", locus_id)
+    next
+  }
+
+  # Find overlap between GWAS MarkerName and LD matrix names
+  common_snps <- intersect(gwas_locus$MarkerName, snps_in_ld)
+  common_snps[1:10]
+
+  if (length(common_snps) < 10) {
+    warning("Too few overlapping SNPs, skipping ", locus_id)
+    next
+  }
+
+  # Subset and Reorder both to match exactly
+  # 1. Subset GWAS and set key for fast indexing
+  gwas_locus <- gwas_locus[MarkerName %in% common_snps]
+  setkey(gwas_locus, MarkerName)
+  
+  # 2. Subset and Reorder Matrix
+  R <- R_raw[common_snps, common_snps]
+  na_snps <- colSums(is.na(R)) > 0
+# Remove them
+  R <- R[!na_snps, !na_snps]
+
+
+  # 3. Final alignment: Ensure GWAS rows are in the exact same order as R columns
+  gwas_locus <- gwas_locus[colnames(R)]
+
+  # Safety check
+  stopifnot(identical(gwas_locus$MarkerName, colnames(R)))
+
+  ############### run susieR ###########
+  z <- gwas_locus$Effect / gwas_locus$StdErr 
+
+  fit <- susie_rss(
+    z = z,
+    R = R,
+    n = 26533,
+    L = L_MAX, 
+    estimate_prior_method = "EM",
+    estimate_residual_variance = FALSE
+  )
+
+  susie_results[[i]] <- list(
+      locus = paste0("chr", chr, ":", pos),
+      fit   = fit,
+      gwas  = gwas_locus
+  )
+}
+
+
+#saveRDS(susie_results, file=file.path(root, "../data_samples/dfss_summary_susie_results.RDS"))
+```
+
+```{r, message=F, warning=F}
+susie_results=readRDS(file.path(root, "../data_samples/dfss_summary_susie_results.RDS"))
+
+summary_list <- list()
+
+for (i in seq_along(susie_results)) {
+  res <- susie_results[[i]]
+  if (is.null(res)) next
+  
+  fit <- res$fit
+  gwas_data <- res$gwas
+  
+  # Check if any credible sets were found
+  if (!is.null(fit$sets$cs)) {
+    
+    # 1. Get the indices of SNPs in credible sets
+    # fit$sets$cs is a list where each element is a vector of SNP indices
+    for (cs_id in names(fit$sets$cs)) {
+      snp_idx <- fit$sets$cs[[cs_id]]
+      
+      # 2. Extract details for these specific SNPs
+      cs_snps <- gwas_data[snp_idx, ]
+      cs_snps$PIP <- fit$pip[snp_idx]
+      cs_snps$CS <- cs_id
+      cs_snps$Locus <- res$locus
+      cs_snps$Purity <- fit$sets$purity[cs_id, "min.abs.corr"] # Quality check
+      
+      summary_list[[length(summary_list) + 1]] <- cs_snps
+    }
+  }
+}
+
+# Combine all loci into one data frame
+final_summary <- bind_rows(summary_list)
+
+final_summary %>% 
+  arrange(desc(PIP)) %>% 
+  select(Locus, MarkerName, CS, PIP, Purity, everything()) %>% 
+  datatable(extensions = 'Buttons',
+          caption = "", 
+            options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+
+```{r, echo=FALSE, message=F, warning=F, eval=F}
+library(ggplot2)
+library(gridExtra)
+plot_susie_locus <- function(res_list, index) {
+  # 1. Extract and check data
+  locus_data <- res_list[[index]]
+  if (is.null(locus_data)) return(message("Locus index is empty."))
+  
+  df <- as.data.frame(locus_data$gwas)
+  df$PIP <- locus_data$fit$pip
+  
+  # 2. Identify the P-value column
+  # We'll look for common names. Adjust "P" if your column has a unique name.
+  p_col <- grep("^(P|PVALUE|P.VALUE|p|pvalue)$", colnames(df), ignore.case = TRUE, value = TRUE)
+  
+  if (length(p_col) == 0) {
+    stop("Could not find a P-value column. Available columns are: ", paste(colnames(df), collapse=", "))
+  }
+  
+  # Rename for the plot logic
+  df$pval_for_plot <- df[[p_col[1]]]
+
+  # 3. Identify SNPs in Credible Sets
+  df$InCS <- "No"
+  if (!is.null(locus_data$fit$sets$cs)) {
+    for (cs_name in names(locus_data$fit$sets$cs)) {
+      idx <- locus_data$fit$sets$cs[[cs_name]]
+      df$InCS[idx] <- cs_name
+    }
+  }
+
+  # 4. GWAS Plot (-log10 P-value)
+  p1 <- ggplot(df, aes(x = BP / 1e6, y = -log10(pval_for_plot), color = InCS)) +
+    geom_point(alpha = 0.6) +
+    # Use a color scale that expands based on number of CS found
+    scale_color_manual(values = c("No" = "grey30", 
+                                 "L1" = "firebrick1", 
+                                 "L2" = "dodgerblue", 
+                                 "L3" = "forestgreen",
+                                 "L4" = "purple",
+                                 "L5" = "orange")) +
+    labs(title = paste("Locus:", locus_data$locus), 
+         y = expression(-log[10](P)), 
+         x = "") +
+    theme_bw() +
+    theme(legend.position = "none", panel.grid = element_blank())
+
+  # 5. SuSiE PIP Plot
+  p2 <- ggplot(df, aes(x = BP / 1e6, y = PIP, color = InCS)) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = c("No" = "grey30", 
+                                 "L1" = "firebrick1", 
+                                 "L2" = "dodgerblue", 
+                                 "L3" = "forestgreen",
+                                 "L4" = "purple",
+                                 "L5" = "orange")) +
+    geom_hline(yintercept = 0.95, linetype = "dashed", color = "black", alpha = 0.5) +
+    labs(y = "SuSiE PIP", x = "Position (Mb)") +
+    ylim(0, 1.05) +
+    theme_bw() +
+    theme(panel.grid = element_blank())
+
+  # Stack the plots
+  grid.arrange(p1, p2, ncol = 1)
+}
+
+# Run the plot
+plot_susie_locus(susie_results, 10)
+```
+
+
+
+[LD matrix inconsistency issue](https://github.com/stephenslab/susieR/issues/148)
+

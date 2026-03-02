@@ -9,3 +9,8 @@ editor_options:
 ---
 
 Welcome to my research website.
+
+
+* [computing LD matrix](LD_matrix.html)
+
+* [run susieR](run_susier.html)
