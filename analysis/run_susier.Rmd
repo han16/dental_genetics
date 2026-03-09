@@ -199,6 +199,9 @@ for (i in seq_along(ld_files))
 #saveRDS(susie_results, file=file.path(root, "../data_samples/dfss_summary_susie_results.RDS"))
 ```
 
+
+
+
 ```{r, message=F, warning=F}
 susie_results=readRDS(file.path(root, "../data_samples/dfss_summary_susie_results.RDS"))
 
@@ -232,11 +235,11 @@ for (i in seq_along(susie_results)) {
 }
 
 # Combine all loci into one data frame
-final_summary <- bind_rows(summary_list)
+susie_final_summary <- bind_rows(summary_list)
 
-final_summary %>% 
+susie_final_summary %>% 
   arrange(desc(PIP)) %>% 
-  select(Locus, MarkerName, CS, PIP, Purity, everything()) %>% 
+  dplyr::select(Locus, MarkerName, CS, PIP, Purity, everything()) %>% 
   datatable(extensions = 'Buttons',
           caption = "", 
             options = list(dom = 'Blfrtip',
@@ -321,18 +324,18 @@ plot_susie_locus(susie_results, 10)
 [LD matrix inconsistency issue](https://github.com/stephenslab/susieR/issues/148)
 
 
-## 
+## position mapping 
 
 
 ```{r, message=F, warning=F}
 library(biomaRt)
 
-# Initialize Ensembl (GRCh37/hg19 or hg38 depending on your data)
+# Initialize Ensembl 
 ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://grch37.ensembl.org")
 
 # 2. Get the unique chromosome/position ranges from results
 # We search 50kb upstream and downstream to find nearby genes
-regions <- final_summary %>%
+regions <- susie_final_summary %>%
   mutate(start = BP - 50000, end = BP + 50000) %>%
   dplyr::select(CHR, start, end) %>%
   distinct()
@@ -346,6 +349,8 @@ gene_list <- getBM(
   mart = ensembl
 )
 ```
+
+
 
 ```{r, message=F, warning=F}
 # 4. Define a helper function to find the nearest gene
@@ -367,18 +372,115 @@ find_nearest_gene <- function(chr, pos, genes_df) {
 
 # 5. Apply to final_summary
 mapping_results <- t(mapply(find_nearest_gene, 
-                            final_summary$CHR, 
-                            final_summary$BP, 
+                            susie_final_summary$CHR, 
+                            susie_final_summary$BP, 
                             MoreArgs = list(genes_df = gene_list)))
 
 # 6. Add columns to your summary
-final_summary$ensembl_gene_id <- mapping_results[, 1]
-final_summary$external_gene_name <- mapping_results[, 2]
+positional_mapping=susie_final_summary
+positional_mapping$ensembl_gene_id <- mapping_results[, 1]
+positional_mapping$external_gene_name <- mapping_results[, 2]
 
 
-final_summary %>%
+positional_mapping %>%
   dplyr::select(Locus, MarkerName, PIP, external_gene_name, ensembl_gene_id, everything()) %>%
   arrange(desc(PIP)) %>%
   datatable(caption = "SuSiE Results with Nearest hg19 Genes")
 ```
 
+
+##  eQTL Colocalization 
+
+
+```{r, message=F, warning=F}
+### 1. LOAD LIBRARIES
+library(biomaRt)
+library(gtexr)
+library(dplyr)
+library(DT)
+
+###  CONVERT HG19 COORDINATES TO rsIDs
+# Connect to hg19 SNP database
+snp_mart <- useMart(biomart = "ENSEMBL_MART_SNP", 
+                    host = "https://grch37.ensembl.org", 
+                    dataset = "hsapiens_snp")
+
+# Retrieve rsIDs based on CHR and BP
+snp_conversion <- getBM(
+  attributes = c('refsnp_id', 'chr_name', 'chrom_start'),
+  filters = c('chr_name', 'start', 'end'),
+  values = list(positional_mapping$CHR, positional_mapping$BP, positional_mapping$BP),
+  mart = snp_mart
+)
+
+# Merge rsIDs into the summary
+eqtl_final_summary <- positional_mapping %>%
+  left_join(snp_conversion, by = c("CHR" = "chr_name", "BP" = "chrom_start")) %>%
+  rename(rsid = refsnp_id)
+
+# Filter for SNPs that have both an rsID and an assigned Gene ID
+to_process <- eqtl_final_summary %>% 
+  filter(!is.na(rsid), !is.na(ensembl_gene_id)) %>%
+  distinct(rsid, ensembl_gene_id, .keep_all = TRUE)
+```
+
+
+```{r, message=F, warning=F}
+###  FETCH EQTL DATA FROM GTEx
+# We use a loop with tryCatch to handle API misses gracefully
+fetch_eqtl <- function(rsid, gene_id, tissue) {
+  tryCatch({
+    res <- calculate_expression_quantitative_trait_loci(
+      tissueSiteDetailId = tissue,
+      gencodeId = gene_id,
+      variantId = rsid
+    )
+    if(nrow(res) > 0) return(res) else return(NULL)
+  }, error = function(e) return(NULL))
+}
+
+
+# Run the query (Example tissue: Skin as proxy for oral mucosa)
+# You can change this to "Whole_Blood" or "Minor_Salivary_Gland"
+target_tissue <- "Whole_Blood"
+
+eqtl_results_list <- mapply(fetch_eqtl, 
+                            to_process$rsid, 
+                            to_process$ensembl_gene_id, 
+                            MoreArgs = list(tissue = target_tissue), 
+                            SIMPLIFY = FALSE)
+eqtl_results_list
+# Combine results
+eqtl_results_df <- bind_rows(eqtl_results_list)
+```
+
+
+
+```{r, message=F, warning=F}
+### JOIN AND ANALYZE CONSISTENCY
+if (nrow(eqtl_results_df) > 0) {
+  # Join GWAS and eQTL data
+  final_coloc_report <- to_process %>%
+    inner_join(eqtl_results_df, by = c("rsid" = "snpId", "ensembl_gene_id" = "gencodeId")) %>%
+    mutate(
+      Direction_Match = sign(Effect) == sign(nes),
+      eQTL_Sig = ifelse(pValue < 0.05, "Yes", "No")
+    ) %>%
+    select(
+      rsid, PIP, external_gene_name, 
+      GWAS_Effect = Effect, eQTL_NES = nes, 
+      eQTL_P = pValue, Direction_Match, eQTL_Sig
+    )
+
+  # Display the results
+  datatable(final_coloc_report, 
+            caption = paste("eQTL Colocalization Summary (Tissue:", target_tissue, ")"),
+            options = list(pageLength = 10))
+  
+  # Export results
+ # write.csv(final_coloc_report, "Final_FineMapping_eQTL_Report.csv", row.names = FALSE)
+  
+} else {
+  print("No eQTL matches found in the specified tissue.")
+}
+```
